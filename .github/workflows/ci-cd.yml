@@ -1,0 +1,148 @@
+name: CI/CD Campus Hub
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+env:
+  DOCKERHUB_BACKEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/campus-hub-backend
+  DOCKERHUB_FRONTEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/campus-hub-frontend
+
+jobs:
+  test:
+    name: Test (CI)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Test Backend
+        run: |
+          cd backend
+          chmod +x gradlew
+          ./gradlew test
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Lint & Build Frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run lint
+          npm run build
+
+  build-and-push:
+    name: Build & Push Docker Images
+    needs: test
+    if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & Push Backend Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_BACKEND_IMAGE }}:latest
+            ${{ env.DOCKERHUB_BACKEND_IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & Push Frontend Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_FRONTEND_IMAGE }}:latest
+            ${{ env.DOCKERHUB_FRONTEND_IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to VPS (CD)
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          passphrase: ${{ secrets.VPS_PASSPHRASE }}
+          script: |
+            # Ensure curl and docker compose are available
+            if ! command -v curl &> /dev/null; then
+              apt-get update && apt-get install -y curl
+            fi
+            if ! docker compose version &> /dev/null && ! command -v docker-compose &> /dev/null; then
+              apt-get update && apt-get install -y docker-compose-plugin || apt-get install -y docker-compose || true
+              if ! docker compose version &> /dev/null && ! command -v docker-compose &> /dev/null; then
+                curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+                chmod +x /usr/local/bin/docker-compose
+              fi
+            fi
+
+            # Determine docker compose command
+            COMPOSE_CMD="docker compose"
+            if ! docker compose version &> /dev/null; then
+              if command -v docker-compose &> /dev/null; then
+                COMPOSE_CMD="docker-compose"
+              fi
+            fi
+
+            mkdir -p ~/campus-hub && cd ~/campus-hub
+
+            # Download docker-compose.yml from repository
+            curl -sSL https://raw.githubusercontent.com/khanhh89/sesion13_mini/main/docker-compose.yml -o docker-compose.yml
+
+            # Generate .env configuration
+            echo "DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}" > .env
+            echo "IMAGE_TAG=latest" >> .env
+            echo "DB_NAME=campus_hub" >> .env
+            echo "DB_USERNAME=root" >> .env
+            echo "DB_PASSWORD=123456" >> .env
+            echo "CORS_ALLOWED_ORIGINS=*" >> .env
+
+            # Pull images and start containers
+            $COMPOSE_CMD pull
+            $COMPOSE_CMD down || true
+            $COMPOSE_CMD up -d
+
+            # Check status
+            sleep 5
+            $COMPOSE_CMD ps
+
